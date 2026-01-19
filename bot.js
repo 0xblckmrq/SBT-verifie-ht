@@ -1,116 +1,110 @@
-const { Client, GatewayIntentBits } = require('discord.js');
-const { ethers } = require('ethers');
-const crypto = require('crypto');
-const express = require('express');
+const { Client, GatewayIntentBits } = require("discord.js");
+const express = require("express");
+const { ethers } = require("ethers");
 
-// -------------------- CONFIG --------------------
-const DISCORD_TOKEN = process.env.BOT_TOKEN ; // Your bot token
-const ROLE_NAME = "Human ID verified"; // Role in your Discord server
+// ===== CONFIG =====
+const ROLE_NAME = "Human ID Verified";
 const SBT_CONTRACT = "0x2AA822e264F8cc31A2b9C22f39e5551241e94DfB";
-const OPTIMISM_RPC = "https://mainnet.optimism.io";
-// -------------------------------------------------
+const RPC_URL = "https://mainnet.optimism.io";
+// ==================
+
+const token = process.env.BOT_TOKEN;
+if (!token) {
+  console.error("BOT_TOKEN not set");
+  process.exit(1);
+}
 
 // Discord client
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers
+  ]
 });
 
-// Ethers setup
-const provider = new ethers.JsonRpcProvider(OPTIMISM_RPC);
-const sbtAbi = [
-  "function balanceOf(address owner) view returns (uint256)"
-];
-const sbtContract = new ethers.Contract(SBT_CONTRACT, sbtAbi, provider);
-
-// Temporary storage for challenges
-const challenges = {};
-
-// Optional API for debugging
+// Express server for Render
 const app = express();
-app.get('/verify/:address', async (req, res) => {
-  try {
-    const address = req.params.address;
-    const balance = await sbtContract.balanceOf(address);
-    res.json({ address, holdsSBT: balance > 0 });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
+app.get("/", (req, res) => res.send("SBT bot alive"));
 app.listen(3000, () => console.log("API running on port 3000"));
 
-// -------------------- BOT --------------------
-client.on('ready', () => {
+// Store challenges
+const challenges = new Map();
+
+// Optimism provider
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+
+// Minimal ERC721 ABI
+const ABI = [
+  "function balanceOf(address owner) view returns (uint256)"
+];
+
+// Ready
+client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-client.on('messageCreate', async (message) => {
+// Messages
+client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
-  // Step 1: User starts verification
-  if (message.content.startsWith('!verify')) {
-    const args = message.content.split(' ');
-    if (!args[1]) {
-      message.reply("Please provide your wallet address. Example: `!verify 0xYourWalletAddress`");
-      return;
-    }
+  // ---- VERIFY ----
+  if (message.content === "!verify") {
+    const challenge = `Verify Discord ${message.author.id} at ${Date.now()}`;
+    challenges.set(message.author.id, challenge);
 
-    const wallet = args[1].toLowerCase();
-    const balance = await sbtContract.balanceOf(wallet);
-    if (balance <= 0) {
-      message.reply("This wallet does not hold the required Human ID SBT.");
-      return;
-    }
-
-    // Generate a random message
-    const challenge = crypto.randomBytes(16).toString('hex');
-    challenges[message.author.id] = { wallet, challenge, timestamp: Date.now() };
-    message.reply(
-      `To verify your wallet, please sign the following message in your wallet and send it back:\n\n` +
+    return message.reply(
+      `✅ **Wallet Verification Started**\n\n` +
+      `1) Sign this message with your wallet:\n` +
       `\`${challenge}\`\n\n` +
-      `Then reply with: !signature <signedMessage>`
+      `2) Then reply with:\n` +
+      `\`!signature <your_signature>\``
     );
-    return;
   }
 
-  // Step 2: User submits signature
-  if (message.content.startsWith('!signature')) {
-    const args = message.content.split(' ');
-    if (!args[1]) {
-      message.reply("Please provide your signed message. Example: `!signature <signedMessage>`");
-      return;
-    }
+  // ---- SIGNATURE ----
+  if (message.content.startsWith("!signature")) {
+    const args = message.content.split(" ");
+    if (!args[1]) return message.reply("Send: `!signature <signature>`");
 
-    const userChallenge = challenges[message.author.id];
-    if (!userChallenge) {
-      message.reply("No verification request found. Start with `!verify <wallet>` first.");
-      return;
-    }
-
-    const { wallet, challenge } = userChallenge;
     const signature = args[1];
+    const challenge = challenges.get(message.author.id);
+
+    if (!challenge) {
+      return message.reply("Run `!verify` first.");
+    }
+
+    let wallet;
+    try {
+      wallet = ethers.verifyMessage(challenge, signature);
+    } catch (err) {
+      return message.reply("❌ Invalid signature.");
+    }
 
     try {
-      const recovered = ethers.verifyMessage(challenge, signature);
-      if (recovered.toLowerCase() === wallet) {
-        // Assign role
-        const role = message.guild.roles.cache.find(r => r.name === ROLE_NAME);
-        if (!role) {
-          message.reply(`Role "${ROLE_NAME}" not found. Please create it first.`);
-          return;
-        }
-        const member = await message.guild.members.fetch(message.author.id);
-        await member.roles.add(role);
-        message.reply("Success! You have been given the Human ID verified role.");
-        delete challenges[message.author.id]; // Clear challenge
-      } else {
-        message.reply("Signature does not match the provided wallet.");
+      const contract = new ethers.Contract(SBT_CONTRACT, ABI, provider);
+      const balance = await contract.balanceOf(wallet);
+
+      if (balance == 0n) {
+        return message.reply("❌ This wallet does not hold the Human ID SBT.");
       }
+
+      const role = message.guild.roles.cache.find(r => r.name === ROLE_NAME);
+      if (!role) return message.reply("Role not found on server.");
+
+      const member = await message.guild.members.fetch(message.author.id);
+      await member.roles.add(role);
+
+      challenges.delete(message.author.id);
+
+      return message.reply(`✅ Verified!\nWallet: ${wallet}`);
     } catch (err) {
-      console.error("Signature verification error:", err);
-      message.reply("Error verifying signature. Make sure you signed the exact message provided.");
+      console.error(err);
+      return message.reply("Error checking SBT ownership.");
     }
-    return;
   }
 });
 
-client.login(DISCORD_TOKEN);
+// Login
+client.login(token);
